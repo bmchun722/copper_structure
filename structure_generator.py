@@ -4,7 +4,7 @@ from pymatgen.core import Structure, Lattice, Molecule
 from pymatgen.core.surface import SlabGenerator
 from pymatgen.io.vasp import Poscar
 from pymatgen.analysis.adsorption import AdsorbateSiteFinder
-
+import numpy as np
 
 cu_bulk = Structure.from_spacegroup("Fm-3m", Lattice.cubic(3.61), ["Cu"], [[0,0,0]]) ## meaning of coordinates?
 co_molecule = Molecule(["C", "O"], [[0,0,0], [0,0,1.13]]) ## what is the meaning of coordinates?
@@ -27,31 +27,73 @@ orthogonal_slab.make_supercell([[3, 0, 0], [0, 1, 0], [0, 0, 1]])
 
 
 asf = AdsorbateSiteFinder(orthogonal_slab)
-sites_dict = asf.find_adsorption_sites(distance=1.0)
 adsorbed_structures = asf.generate_adsorption_structures(
     co_molecule, 
     repeat=[1, 1, 1], 
     min_lw=10.0,         # Minimum vacuum size
-    find_args={"distance": 2.0}  # Height of C atom above surface
+    find_args={"distance": 1.0}  # Height of C atom above surface
 )
-print(f"Total distinct sites found: {len(adsorbed_structures)}")
+sites_dict = asf.find_adsorption_sites(distance=0.0)
 
+target_neighbors = {
+    'ontop': 1,
+    'bridge': 2,
+    'hollow': 3
+}
 for label, coords_list in sites_dict.items():
-    if label == 'all': continue  # Skip the summary list
+    if label == 'all': continue
     
-    for i, coord in enumerate(coords_list):
-        struct = orthogonal_slab.copy()
-        mol_copy = co_molecule.copy()
-        mol_copy.translate_sites(indices=range(len(mol_copy)),vector=coord)
-        # 3. Save immediately with the correct name
-        for atom in mol_copy:
-            struct.append(atom.specie, atom.coords, coords_are_cartesian=True)
-
-        filename = f"POSCAR_{label}_{i}.vasp"
-        Poscar(struct).write_file(filename)
+    # Determine how many atoms support this type (e.g., bridge uses 2)
+    n_target = target_neighbors.get(label, 1) 
+    
+    for i, crude_coord in enumerate(coords_list):
         
-        print(f"Saved: {filename}")
-
+        # --- [1] Geometric Refinement of Coordinates ---
+        
+        # Find all Cu atoms within a sphere (radius 2.5A) around the coordinate.
+        # (Considers Periodic Boundary Conditions)
+        neighbors = orthogonal_slab.get_sites_in_sphere(crude_coord, r=2.5)
+        
+        # Sort by distance and pick only the closest n_target atoms.
+        # e.g., Top 2 for Bridge, Top 3 for Hollow.
+        sorted_neighbors = sorted(neighbors, key=lambda x: x[1]) # x[1] is distance
+        closest_sites = [n[0] for n in sorted_neighbors[:n_target]]
+        
+        if not closest_sites: continue # Skip if no neighbors are found
+        
+        # Extract coordinates of the found Cu atoms
+        cu_coords = [site.coords for site in closest_sites]
+        cu_coords = np.array(cu_coords)
+        
+        # A. X, Y coordinates: Mean of Cu atoms (Perfect symmetry point)
+        center_x = np.mean(cu_coords[:, 0])
+        center_y = np.mean(cu_coords[:, 1])
+        
+        # B. Z coordinate: Based on the 'highest' atom among neighbors
+        # This prevents the molecule from being buried in the step edge.
+        max_z = np.max(cu_coords[:, 2])
+        safe_z = max_z + 1.85  # Cu-C bond length approx 1.85 A
+        
+        # Finalize C position
+        exact_c_pos = np.array([center_x, center_y, safe_z])
+        
+        
+        # --- [2] Generate Structure ---
+        struct = orthogonal_slab.copy()
+        
+        # Add C (at refined position)
+        struct.append("C", exact_c_pos, coords_are_cartesian=True)
+        
+        # Add O (Vertical, directly above C)
+        # Let VASP find the optimal tilt during relaxation.
+        exact_o_pos = exact_c_pos + np.array([0, 0, 1.13])
+        struct.append("O", exact_o_pos, coords_are_cartesian=True)
+        
+        
+        # --- [3] Save ---
+        filename = f"POSCAR_{label}_{i}_exact.vasp"
+        Poscar(struct).write_file(filename)
+        print(f"Saved: {filename} (Refined using {n_target} Cu atoms)")
 
 
 
